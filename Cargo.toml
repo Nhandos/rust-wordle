@@ -1,0 +1,13 @@
+[package]
+name = "wordle_solver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+bincode = "1.3"
+gnuplot = "0.0.46"
+
+[[bin]]
+name = "wordle_solver"
+path = "main.rs"
