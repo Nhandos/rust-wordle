@@ -1,10 +1,17 @@
-use gnuplot::FillPatternType::Pattern0;
-use gnuplot::{AxesCommon, ColorType, Figure};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
+
+// Open 5 letter words dictionary
+fn open_dictionary<P: AsRef<Path>>(path: P) -> io::Result<Vec<String>> {
+    let file = File::open(path)?;
+    let reader = io::BufReader::new(file);
+
+    let words: Vec<String> = reader.lines().filter_map(Result::ok).collect();
+
+    Ok(words)
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum MatchKind {
@@ -24,18 +31,10 @@ impl fmt::Display for MatchKind {
     }
 }
 
-// Open 5 letter words dictionary
-fn open_dictionary<P: AsRef<Path>>(path: P) -> io::Result<Vec<String>> {
-    let mut success = false;
-    let file = File::open(path)?;
-    let reader = io::BufReader::new(file);
+// Declare a custom match result
+type MatchResult = [MatchKind; 5];
 
-    let words: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-
-    Ok(words)
-}
-
-#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct WordEncoding {
     positions: [char; 5],  // Encode symbol position
     frequencies: [u8; 26], // Encode symbol frequency
@@ -50,7 +49,7 @@ impl WordEncoding {
     pub fn from_string(word: &str) -> WordEncoding {
         let mut positions = ['A'; 5];
         let mut frequencies = [0u8; 26];
-        let mut likelihood: f32 = 1.0;
+        let likelihood: f32 = 1.0;
 
         for (i, c) in word.chars().enumerate() {
             positions[i] = c.to_ascii_uppercase();
@@ -65,7 +64,7 @@ impl WordEncoding {
         }
     }
 
-    pub fn match_result(&self, other: &WordEncoding) -> [MatchKind; 5] {
+    pub fn match_result(&self, other: &WordEncoding) -> MatchResult {
         let mut result = [
             MatchKind::NoMatch,
             MatchKind::NoMatch,
@@ -88,195 +87,274 @@ impl WordEncoding {
         result
     }
 
-    pub fn match_results(&self, other: &Vec<WordEncoding>) -> Vec<[MatchKind; 5]> {
-        let mut results: Vec<[MatchKind; 5]> = Vec::new();
+    pub fn match_results(
+        &self,
+        other: &Vec<WordEncoding>,
+        indices: &Vec<usize>,
+    ) -> Vec<(MatchResult, f32)> {
+        let mut results: Vec<(MatchResult, f32)> = Vec::new();
 
-        for word in other {
-            results.push(self.match_result(word));
+        for i in indices {
+            results.push((self.match_result(&other[*i]), other[*i].likelihood));
         }
 
         results
     }
 }
 
-fn compute_and_save_word_encodings(words: &Vec<String>, save_path: &str) -> io::Result<()> {
-    let mut encodings: Vec<WordEncoding> = Vec::new();
-    // Compute encoding for each word
-    for word in words {
-        encodings.push(WordEncoding::from_string(word));
+struct WordleSolver {
+    dictionary: Vec<WordEncoding>,
+    current_possibilities: Vec<usize>,
+    current_guess: Option<WordEncoding>,
+    current_guess_entropy: f32,
+    current_guess_match_result: Option<Vec<(MatchResult, f32)>>,
+    current_guess_match_pattern_pd: Option<[f32; 243]>,
+    current_expected_score: f32,
+}
+
+impl WordleSolver {
+    pub fn intialise(dictionary_path: &String) -> Result<WordleSolver, String> {
+        let solver: WordleSolver;
+
+        let dictionary_result = open_dictionary(dictionary_path);
+        if dictionary_result.is_err() {
+            return Err(format!(
+                "Error opening dictionary: {}",
+                dictionary_result.unwrap_err()
+            )
+            .to_string());
+        }
+
+        let dictionary = dictionary_result.unwrap();
+        let dictionary_len = dictionary.len();
+
+        println!("Loaded dictionary with {} words", dictionary_len);
+
+        solver = WordleSolver {
+            dictionary: WordleSolver::compute_word_encodings(&dictionary),
+            current_possibilities: (0..dictionary_len).collect(),
+            current_guess: None,
+            current_guess_entropy: 0.0,
+            current_guess_match_result: None,
+            current_guess_match_pattern_pd: None,
+            current_expected_score: WordleSolver::compute_expected_score(
+                (dictionary_len as f32).log2(),
+            ),
+        };
+
+        Ok(solver)
     }
-    let bytes = bincode::serialize(&encodings)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Serialization error: {}", e)))?;
 
-    let mut file = File::create(save_path)?;
+    pub fn reset(&mut self) {
+        // Reset values
+        self.current_guess = None;
+        self.current_guess_entropy = 0.0;
+        self.current_guess_match_result = None;
+        self.current_guess_match_pattern_pd = None;
 
-    file.write_all(&bytes)?;
+        // Reset possibilties
+        self.current_possibilities = (0..self.dictionary.len()).collect();
+    }
 
-    Ok(())
-}
+    pub fn guess<CheckFunction>(&mut self, callback: CheckFunction)
+    where
+        CheckFunction: Fn(&WordEncoding) -> MatchResult,
+    {
+        if let Some(some_guess) = &self.current_guess {
+            let actual_match = callback(some_guess);
 
-fn load_word_encodings(path: &str) -> io::Result<Vec<WordEncoding>> {
-    let mut file = File::open(path)?;
-    let mut buffer = Vec::new();
+            let keep_indices: Vec<usize> = self
+                .current_guess_match_result
+                .as_ref()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter(|(_, val)| (**val).0 == actual_match)
+                .map(|(index, _)| index)
+                .collect();
 
-    file.read_to_end(&mut buffer)?;
+            self.current_possibilities = keep_indices
+                .iter()
+                .map(|i| self.current_possibilities[*i])
+                .collect();
+        }
+    }
 
-    let value = bincode::deserialize(&buffer).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Deserialization error: {}", e),
-        )
-    })?;
+    pub fn step(&mut self) {
+        self.current_guess = None;
+        self.current_guess_entropy = 0.0;
+        self.current_guess_match_result = None;
+        self.current_guess_match_pattern_pd = None;
 
-    Ok(value)
-}
+        // Calculate entropy of every possibilities
+        for guess in self.dictionary.iter() {
+            let match_results = guess.match_results(&self.dictionary, &self.current_possibilities);
+            let match_pattern_pd = WordleSolver::compute_match_pattern_pd(&match_results);
+            let entropy = WordleSolver::compute_entropy(match_pattern_pd);
 
-// Compute the 'match pattern' probability distribution (pd), of a given word over the possibility
-fn compute_match_pattern_pd(match_results: &Vec<[MatchKind; 5]>) -> [f32; 243] {
-    let mut match_pattern_pd: [f32; 243] = [0.0; 243];
-
-    for match_result in match_results {
-        // Compute the index
-        let mut index: usize = 0;
-
-        for i in 0..5 {
-            match match_result[i] {
-                MatchKind::NoMatch => index += 0 * (3 as usize).pow(i as u32),
-                MatchKind::Partial => index += 1 * (3 as usize).pow(i as u32),
-                MatchKind::Match => index += 2 * (3 as usize).pow(i as u32),
+            // TODO: Mimise expected score rather than entropy
+            if entropy > self.current_guess_entropy {
+                self.current_guess = Some(*guess);
+                self.current_guess_entropy = entropy;
+                self.current_guess_match_result = Some(match_results);
+                self.current_guess_match_pattern_pd = Some(match_pattern_pd);
             }
         }
-
-        match_pattern_pd[index] += 1.0;
     }
 
-    // Normalise
-    let sum: f32 = match_pattern_pd.iter().sum();
+    fn compute_word_encodings(words: &Vec<String>) -> Vec<WordEncoding> {
+        let mut encodings: Vec<WordEncoding> = Vec::new();
+        let parametric_sigmoid = |x: f32, midpoint: f32, steepness: f32| -> f32 {
+            1.0 / (1.0 + (-steepness * (x - midpoint)).exp())
+        };
 
-    for x in match_pattern_pd.iter_mut() {
-        *x /= sum;
-    }
-
-    match_pattern_pd
-}
-
-fn compute_entropy<const N: usize>(pd: [f32; N]) -> f32 {
-    let mut entropy: f32 = 0.0;
-    for probabilty in pd.iter() {
-        if *probabilty > 0.0 {
-            entropy += -1.0 * (*probabilty) * (*probabilty).log2();
+        // Compute encoding for each word
+        for (i, word) in words.iter().enumerate() {
+            let mut encoding = WordEncoding::from_string(word);
+            let x = (words.len() - i - 1) as f32;
+            encoding.likelihood = parametric_sigmoid(x, (words.len() as f32) / 2.0, 0.02);
+            println!("{}: {}", encoding.to_string(), encoding.likelihood);
+            encodings.push(encoding);
         }
+
+        encodings
     }
 
-    entropy
-}
+    // Compute the 'match pattern' probability distribution (pd), of a given word over the possibility
+    fn compute_match_pattern_pd(match_results: &Vec<(MatchResult, f32)>) -> [f32; 243] {
+        let mut sum: f32 = 0.0;
+        let mut match_pattern_pd: [f32; 243] = [0.0; 243];
 
-fn generate_word_encodings() {
-    let words = open_dictionary("./words_5_letters.txt").unwrap_or_else(|err| {
-        println!("Error openning dictionary: {}", err);
-        std::process::exit(-1);
-    });
+        for (match_result, likelihood) in match_results {
+            // Compute the index
+            let mut index: usize = 0;
 
-    let result = compute_and_save_word_encodings(&words, "./word_encodings.bin");
-
-    match result {
-        Ok(()) => println!("Encodings saved to ./word_encodings.bin"),
-        Err(err) => {
-            println!("Failed to create encodings: {}", err);
-            std::process::exit(-1);
-        }
-    }
-}
-
-fn plot_match_pattern_pd<const N: usize>(pd: [f32; N]) {
-    // Plot using GNU plot
-
-    // Generate x-values: 0, 1, 2, 3 (indices)
-    let x: Vec<_> = (0..pd.len()).map(|i| i as f32).collect();
-
-    let mut fg = Figure::new();
-    {
-        let axes = fg.axes2d();
-        axes.set_title("Probability Distribution", &[]).boxes(
-            &x,
-            &pd,
-            &[
-                gnuplot::Caption("Probability"),
-                gnuplot::Color(ColorType::RGBString("blue")),
-            ],
-        );
-    }
-
-    fg.show().unwrap();
-}
-
-fn main() {
-    // Open the dictionary and compute encoding
-    // generate_word_encodings();
-
-    // Load encodings
-    {
-        let mut encodings = load_word_encodings("./word_encodings.bin").unwrap_or_else(|err| {
-            println!("Error loading word encodings: {}", err);
-            std::process::exit(-1);
-        });
-        println!("Number of possibilities: {}", encodings.len());
-
-        while encodings.len() > 1 {
-            let mut guess: Option<WordEncoding> = None;
-            let mut guess_entropy: f32 = 0.0;
-            let mut guess_match_result: Vec<[MatchKind; 5]> = Vec::new();
-            // Compute the entropy of each word against the current set of encodings
-            for encoding in encodings.iter() {
-                let match_results = encoding.match_results(&encodings);
-                let match_pattern_pd = compute_match_pattern_pd(&match_results);
-                let entropy = compute_entropy(match_pattern_pd);
-                // plot_match_pattern_pd(match_pattern_pd);
-                if entropy > guess_entropy {
-                    guess = Some(*encoding);
-                    guess_entropy = entropy;
-                    guess_match_result = match_results;
+            for i in 0..5 {
+                match match_result[i] {
+                    MatchKind::NoMatch => index += 0 * (3 as usize).pow(i as u32),
+                    MatchKind::Partial => index += 1 * (3 as usize).pow(i as u32),
+                    MatchKind::Match => index += 2 * (3 as usize).pow(i as u32),
                 }
             }
 
-            if let Some(some_guess) = &guess {
-                println!(
-                    "Guessing with {} at an expected entropy of {}",
-                    some_guess.to_string(),
-                    guess_entropy
-                );
+            match_pattern_pd[index] += likelihood;
+            sum += likelihood;
+        }
 
-                let actual_match = some_guess.match_result(&WordEncoding::from_string("WEARY"));
+        // Normalise
+        for x in match_pattern_pd.iter_mut() {
+            *x /= sum;
+        }
 
-                let keep_indices: Vec<usize> = guess_match_result
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, val)| **val == actual_match)
-                    .map(|(index, _)| index)
-                    .collect();
+        match_pattern_pd
+    }
 
-                let keep_encodings: Vec<_> = keep_indices.iter().map(|&i| encodings[i]).collect();
-
-                encodings = keep_encodings;
-
-                println!("Remaining possibilities: {}", encodings.len());
-            } else {
-                println!("Cannot determine guess");
-                break;
+    fn compute_entropy<const N: usize>(pd: [f32; N]) -> f32 {
+        let mut entropy: f32 = 0.0;
+        for probabilty in pd.iter() {
+            if *probabilty > 0.0 {
+                entropy += -1.0 * (*probabilty) * (*probabilty).log2();
             }
         }
 
-        println!("Final/Possible answer(s): ");
-        for encoding in encodings {
-            println!("{}", encoding.to_string());
-        }
+        entropy
     }
 
-    /*
-    println!("Wordle Solver!\n");
-    let solver = WordleSolver {};
-    let result = wordle_solve(solver, check_function);
+    fn compute_expected_score(entropy: f32) -> f32 {
+        /// TODO: Write function to determine the expected score given the amount of entropy
+        0.0
+    }
+}
 
-    println!("{}", result);
-    */
+fn main() {
+    let mut solver = match WordleSolver::intialise(&"./words_5_letters.txt".to_string()) {
+        Ok(solver) => solver,
+        Err(error) => {
+            eprintln!("failed to initialize WordleSolver: {}", error);
+            std::process::exit(1);
+        }
+    };
+
+    while solver.current_possibilities.len() > 1 {
+        let initial_possibilities = solver.current_possibilities.len();
+
+        // Prime the initial guess using step()
+        solver.step();
+
+        if solver.current_guess.is_none() {
+            eprintln!("failed to find solution: cannot generate next guess");
+            std::process::exit(1);
+        }
+
+        let guess = solver.current_guess.as_ref().unwrap();
+
+        println!(
+            "Guess: {}, Expected ΔEntropy: {}, Remaining Possibilities: {}",
+            guess.to_string(),
+            solver.current_guess_entropy,
+            initial_possibilities
+        );
+
+        // Ask the user for feedback
+        print!("Enter feedback (M = Match, P = Partial, N = No match, e.g. MPNPN): ");
+        io::stdout().flush().unwrap();
+        let mut feedback = String::new();
+        io::stdin()
+            .read_line(&mut feedback)
+            .expect("Failed to read input");
+        let feedback = feedback.trim().to_uppercase();
+
+        if feedback.len() != 5 {
+            eprintln!(
+                "Feedback must be exactly 5 characters (M/P/N). Got: {}",
+                feedback
+            );
+            std::process::exit(1);
+        }
+
+        // Parse feedback into MatchResult
+        let parsed_feedback = match parse_feedback(&feedback) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        };
+
+        // Now filter possibilities manually using the parsed feedback
+        solver.guess(|_| parsed_feedback);
+
+        let actual_entropy: f32 = f32::log2(initial_possibilities as f32)
+            - f32::log2(solver.current_possibilities.len() as f32);
+
+        println!(
+            "New Remaining Possibilities: {}, Actual ΔEntropy: {}",
+            solver.current_possibilities.len(),
+            actual_entropy
+        );
+    }
+
+    println!(
+        "Solution Found: {}",
+        solver.dictionary[solver.current_possibilities[0]].to_string()
+    );
+}
+
+/// Parse the user feedback string like "MPNPN" into MatchResult
+fn parse_feedback(feedback: &str) -> Result<MatchResult, String> {
+    let mut result = [MatchKind::NoMatch; 5];
+    for (i, c) in feedback.chars().enumerate() {
+        result[i] = match c {
+            'M' => MatchKind::Match,
+            'P' => MatchKind::Partial,
+            'N' => MatchKind::NoMatch,
+            _ => {
+                return Err(format!(
+                    "Invalid feedback character '{}'. Use only M, P, N.",
+                    c
+                ));
+            }
+        }
+    }
+    Ok(result)
 }
