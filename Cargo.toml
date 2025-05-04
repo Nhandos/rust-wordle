@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+num_cpus = "1"
 serde = { version = "1.0.219", features = ["derive"] }
 bincode = "1.3"
 gnuplot = "0.0.46"
+clap     = { version = "4", features = ["derive"] }  # tiny CLI
+glob = "0.3"
 
 [[bin]]
 name = "wordle_solver"
