@@ -39,7 +39,7 @@ impl fmt::Display for MatchKind {
 // Declare a custom match result
 type MatchResult = [MatchKind; 5];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct WordEncoding {
     positions: [char; 5],  // Encode symbol position
     frequencies: [u8; 26], // Encode symbol frequency
@@ -76,7 +76,6 @@ impl WordEncoding {
         let mut result = [MatchKind::NoMatch; 5];
         let mut remaining = other.frequencies; // local mutable copy
 
-        // 1️⃣  mark exact matches first
         for i in 0..5 {
             if self.positions[i] == other.positions[i] {
                 result[i] = MatchKind::Match;
@@ -84,7 +83,6 @@ impl WordEncoding {
             }
         }
 
-        // 2️⃣  mark partial matches
         for i in 0..5 {
             if result[i] == MatchKind::NoMatch {
                 let idx = Self::idx(self.positions[i]);
@@ -109,6 +107,7 @@ struct WordleSolver {
     dictionary: Vec<WordEncoding>, // Dictionary as tuple of WordEncoding, sorted by rank. E.G. dictionary[0] is the word with the highest frequency
     policy: Policy,                // The policy of the algorithm
     expected_moves_curve: Vec<Bucket>, // The expected moves given an entropy (from our training)
+    previous_guesses: Vec<WordEncoding>, // Track previous guesses
 
     // These are our state variables - should be updated on every iteration or guess
     prior: Vec<f64>, // P_W(w): The probability mass function of how plausible our word is the answer
@@ -147,6 +146,7 @@ impl WordleSolver {
         solver = WordleSolver {
             dictionary: WordleSolver::compute_word_encodings(&dictionary),
             policy,
+            previous_guesses: Vec::new(),
             prior: vec![0.0; dictionary_len],
             current_possibilities: (0..dictionary_len).collect(),
             current_guess: None,
@@ -170,6 +170,7 @@ impl WordleSolver {
         self.current_guess_match_result = None;
         self.current_guess_match_pattern_pd = None;
         self.current_expected_score = f64::INFINITY;
+        self.previous_guesses.clear();
 
         // Reset possibilties
         self.current_possibilities = (0..self.dictionary.len()).collect();
@@ -202,6 +203,8 @@ impl WordleSolver {
         CheckFunction: Fn(&WordEncoding) -> MatchResult,
     {
         if let Some(some_guess) = &self.current_guess {
+            self.previous_guesses.push(*some_guess);
+
             let actual_match = callback(some_guess);
 
             let keep_indices: Vec<usize> = self
@@ -232,6 +235,11 @@ impl WordleSolver {
 
         // Calculate entropy of every possibilities
         for (i, guess) in self.dictionary.iter().enumerate() {
+            // Do not repeat our guess
+            if self.previous_guesses.contains(guess) {
+                continue;
+            }
+
             let mut match_results: Vec<(MatchResult, f64)> = Vec::new();
 
             for j in self.current_possibilities.iter() {
@@ -250,7 +258,9 @@ impl WordleSolver {
                     self.current_guess_match_pattern_pd = Some(match_pattern_pd);
                 }
             } else if self.policy == Policy::MinimizeScore {
-                let expected_score = self.prior[i]
+                // We really need to punish when the prior is zero - we only want to explore when prior is zero
+
+                let expected_score = 1.0
                     + (1.0 - self.prior[i])
                         * self.compute_expected_score(
                             (self.current_possibilities.len() as f64).log2() - entropy,
