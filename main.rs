@@ -592,7 +592,6 @@ impl RunKind {
 fn run_generic_worker(kind: RunKind, worker_id: usize, total_workers: usize) {
     std::fs::create_dir_all(kind.dir()).expect("cannot create output dir");
 
-    // 1️⃣  open shard
     let shard_name = kind.shard_name(worker_id);
     let mut writer = BufWriter::new(
         OpenOptions::new()
@@ -605,7 +604,6 @@ fn run_generic_worker(kind: RunKind, worker_id: usize, total_workers: usize) {
         writeln!(writer, "secret_idx,entropy,moves_remaining").unwrap();
     }
 
-    // 2️⃣  fresh solver
     let mut solver = WordleSolver::intialise(
         &"./words_5_letters.txt".to_owned(),
         Policy::MaximizeEntropy,
@@ -613,7 +611,6 @@ fn run_generic_worker(kind: RunKind, worker_id: usize, total_workers: usize) {
     )
     .unwrap();
 
-    // 3️⃣  iterate over secrets round‑robin
     let max_secrets = 1_500.min(solver.dictionary.len());
     for secret_idx in (0..max_secrets).filter(|i| i % total_workers == worker_id) {
         let secret = solver.dictionary[secret_idx];
